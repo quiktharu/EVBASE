@@ -1,0 +1,482 @@
+"""
+EV Base - Linux GUI EV Charging Station
+
+
+
+Dependencies:
+- Python 3.8+
+- PyQt5
+- pyserial
+- requests
+
+Install on Debian/Ubuntu:
+    python3 -m pip install pyqt5 pyserial requests
+
+Run:
+    python3 main.py
+
+
+"""
+
+import sys
+import time
+import threading
+import json
+from PyQt5 import QtWidgets, QtGui, QtCore
+import serial
+import requests
+
+# ---------------------- Configuration ----------------------
+PRICE_PER_KW = 150  # LKR per kW
+SMS_API_URL = "https://your.sms.provider/send"  # replace with real SMS API
+SMS_API_KEY = "REPLACE_WITH_KEY"
+CARD_SERIAL_PORT = "/dev/ttyUSB0"  # default serial port for card machine
+CARD_BAUDRATE = 9600
+EV_CONTROL_SERIAL_PORT = "/dev/ttyUSB1"  # serial port to send activation commands to EV charger
+EV_CONTROL_BAUDRATE = 9600
+PAYMENT_COMMAND_TEMPLATE = "PAY {amount_lkr}\n"  # placeholder command sent to card machine; replace
+PAYMENT_CONFIRM_RESPONSE_SUBSTR = "APPROVED"  # substring expected from card machine on success
+EV_ACTIVATE_COMMAND_TEMPLATE = "START_CHARGE PORT={port} KW={kw}\n"  # placeholder
+SERIAL_TIMEOUT = 15  # seconds to wait for responses
+
+# ---------------------- Helpers ----------------------
+
+def safe_serial_send_receive(port, baudrate, send_bytes, timeout=SERIAL_TIMEOUT):
+    """Open serial, send data, wait for a response (or timeout). Returns (success, response_text)"""
+    try:
+        ser = serial.Serial(port, baudrate, timeout=1)
+    except Exception as e:
+        return False, f"OPEN_PORT_ERROR: {e}"
+
+    try:
+        ser.reset_input_buffer()
+        ser.write(send_bytes if isinstance(send_bytes, bytes) else str(send_bytes).encode('utf-8'))
+        ser.flush()
+        # read until timeout
+        end_time = time.time() + timeout
+        out = b""
+        while time.time() < end_time:
+            data = ser.read(256)
+            if data:
+                out += data
+                # If we detect newline response, break (optional)
+                if b"\n" in out:
+                    break
+            else:
+                time.sleep(0.1)
+        ser.close()
+        return True, out.decode('utf-8', errors='ignore')
+    except Exception as e:
+        try:
+            ser.close()
+        except:
+            pass
+        return False, f"IO_ERROR: {e}"
+
+
+def send_sms(to_number, message):
+    """REPLACE using ORIGINAL HTTP API. """
+    payload = {
+        'api_key': SMS_API_KEY,
+        'to': to_number,
+        'message': message
+    }
+    try:
+        r = requests.post(SMS_API_URL, json=payload, timeout=10)
+        return r.status_code == 200, r.text
+    except Exception as e:
+        return False, str(e)
+
+# ---------------------- GUI Widgets ----------------------
+
+class OnScreenKeyboard(QtWidgets.QWidget):
+    """Simple numeric on-screen keyboard with backspace and clear."""
+    textChanged = QtCore.pyqtSignal(str)
+
+    def __init__(self, target_lineedit=None, allow_plus=False):
+        super().__init__()
+        self.target = target_lineedit
+        self.allow_plus = allow_plus
+        self._build_ui()
+
+    def _build_ui(self):
+        grid = QtWidgets.QGridLayout()
+        keys = [
+            ['7','8','9'],
+            ['4','5','6'],
+            ['1','2','3'],
+            ['0','.','<-']
+        ]
+        for r,row in enumerate(keys):
+            for c,k in enumerate(row):
+                btn = QtWidgets.QPushButton(k)
+                btn.setFixedSize(60,40)
+                btn.clicked.connect(self._key_pressed)
+                grid.addWidget(btn, r, c)
+        clear = QtWidgets.QPushButton('Clear')
+        clear.clicked.connect(self._clear)
+        grid.addWidget(clear, 4, 0, 1, 3)
+        self.setLayout(grid)
+
+    def _key_pressed(self):
+        sender = self.sender()
+        if not self.target:
+            return
+        key = sender.text()
+        cur = self.target.text()
+        if key == '<-':
+            cur = cur[:-1]
+        else:
+            cur += key
+        self.target.setText(cur)
+        self.textChanged.emit(cur)
+
+    def _clear(self):
+        if not self.target:
+            return
+        self.target.setText("")
+        self.textChanged.emit("")
+
+
+class WelcomePage(QtWidgets.QWidget):
+    proceed = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout()
+        v.setAlignment(QtCore.Qt.AlignCenter)
+
+        logo = QtWidgets.QLabel()
+        pix = QtGui.QPixmap('EV.png')
+        if pix.isNull():
+            logo.setText('EV Base')
+        else:
+            scaled = pix.scaledToWidth(300, QtCore.Qt.SmoothTransformation)
+            logo.setPixmap(scaled)
+        logo.setAlignment(QtCore.Qt.AlignCenter)
+
+        title = QtWidgets.QLabel("Welcome to \"EV Base\"")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        font = QtGui.QFont()
+        font.setPointSize(18)
+        font.setBold(True)
+        title.setFont(font)
+
+        self.contact_input = QtWidgets.QLineEdit()
+        self.contact_input.setPlaceholderText('Enter contact number (required)')
+        self.contact_input.setFixedWidth(260)
+        self.contact_input.setMaxLength(20)
+
+        self.kb = OnScreenKeyboard(target_lineedit=self.contact_input)
+
+        confirm_btn = QtWidgets.QPushButton('Confirm')
+        confirm_btn.clicked.connect(self._on_confirm)
+
+        v.addWidget(logo)
+        v.addSpacing(8)
+        v.addWidget(title)
+        v.addSpacing(12)
+        v.addWidget(self.contact_input, alignment=QtCore.Qt.AlignCenter)
+        v.addWidget(self.kb, alignment=QtCore.Qt.AlignCenter)
+        v.addWidget(confirm_btn, alignment=QtCore.Qt.AlignCenter)
+
+        self.setLayout(v)
+
+    def _on_confirm(self):
+        v = self.contact_input.text().strip()
+        if not v:
+            QtWidgets.QMessageBox.warning(self, 'Required', 'Contact number is mandatory.')
+            return
+        # Could add validation of phone number here
+        self.proceed.emit(v)
+
+
+class SelectPortPage(QtWidgets.QWidget):
+    proceed = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.selected = None
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout()
+        title = QtWidgets.QLabel('Select charging Port')
+        font = QtGui.QFont(); font.setPointSize(16); font.setBold(True)
+        title.setFont(font);
+        title.setAlignment(QtCore.Qt.AlignCenter)
+
+        h = QtWidgets.QHBoxLayout()
+
+        # CCS2
+        ccs_widget = QtWidgets.QFrame()
+        ccs_layout = QtWidgets.QVBoxLayout()
+        ccs_img = QtWidgets.QLabel()
+        pix = QtGui.QPixmap('CCS2.png')
+        if not pix.isNull():
+            ccs_img.setPixmap(pix.scaledToWidth(160, QtCore.Qt.SmoothTransformation))
+        ccs_label = QtWidgets.QRadioButton('CCS2')
+        ccs_label.toggled.connect(lambda checked: self._select('CCS2') if checked else None)
+        ccs_layout.addWidget(ccs_img, alignment=QtCore.Qt.AlignCenter)
+        ccs_layout.addWidget(ccs_label, alignment=QtCore.Qt.AlignCenter)
+        ccs_widget.setLayout(ccs_layout)
+
+        # GBT
+        gbt_widget = QtWidgets.QFrame()
+        gbt_layout = QtWidgets.QVBoxLayout()
+        gbt_img = QtWidgets.QLabel()
+        pix2 = QtGui.QPixmap('GBT.png')
+        if not pix2.isNull():
+            gbt_img.setPixmap(pix2.scaledToWidth(160, QtCore.Qt.SmoothTransformation))
+        gbt_label = QtWidgets.QRadioButton('GB/T')
+        gbt_label.toggled.connect(lambda checked: self._select('GBT') if checked else None)
+        gbt_layout.addWidget(gbt_img, alignment=QtCore.Qt.AlignCenter)
+        gbt_layout.addWidget(gbt_label, alignment=QtCore.Qt.AlignCenter)
+        gbt_widget.setLayout(gbt_layout)
+
+        h.addWidget(ccs_widget)
+        h.addWidget(gbt_widget)
+
+        next_btn = QtWidgets.QPushButton('Next')
+        next_btn.clicked.connect(self._on_next)
+
+        v.addWidget(title)
+        v.addLayout(h)
+        v.addWidget(next_btn, alignment=QtCore.Qt.AlignCenter)
+        self.setLayout(v)
+
+    def _select(self, name):
+        self.selected = name
+
+    def _on_next(self):
+        if not self.selected:
+            QtWidgets.QMessageBox.warning(self, 'Select', 'Please select a charging port.')
+            return
+        self.proceed.emit(self.selected)
+
+
+class AmountPage(QtWidgets.QWidget):
+    proceed = QtCore.pyqtSignal(float, float)  # kw, lkr
+
+    def __init__(self):
+        super().__init__()
+        self._suppress = False
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout()
+        title = QtWidgets.QLabel('How much energy do you want to charge?')
+        font = QtGui.QFont(); font.setPointSize(14); font.setBold(True)
+        title.setFont(font)
+        title.setAlignment(QtCore.Qt.AlignCenter)
+
+        form = QtWidgets.QFormLayout()
+        self.kw_input = QtWidgets.QLineEdit()
+        self.kw_input.setValidator(QtGui.QDoubleValidator(0.0, 10000.0, 3))
+        self.lkr_input = QtWidgets.QLineEdit()
+        self.lkr_input.setValidator(QtGui.QDoubleValidator(0.0, 100000000.0, 2))
+
+        # link changes
+        self.kw_input.textChanged.connect(self._kw_changed)
+        self.lkr_input.textChanged.connect(self._lkr_changed)
+
+        kb_kw = OnScreenKeyboard(target_lineedit=self.kw_input)
+        kb_lkr = OnScreenKeyboard(target_lineedit=self.lkr_input)
+
+        form.addRow('kW:', self.kw_input)
+        form.addRow('LKR:', self.lkr_input)
+
+        h = QtWidgets.QHBoxLayout()
+        h.addWidget(kb_kw)
+        h.addWidget(kb_lkr)
+
+        next_btn = QtWidgets.QPushButton('Proceed to Payment')
+        next_btn.clicked.connect(self._on_next)
+
+        v.addWidget(title)
+        v.addLayout(form)
+        v.addLayout(h)
+        v.addWidget(next_btn, alignment=QtCore.Qt.AlignCenter)
+        self.setLayout(v)
+
+    def _kw_changed(self, t):
+        if self._suppress:
+            return
+        self._suppress = True
+        try:
+            kw = float(t) if t else 0.0
+        except:
+            kw = 0.0
+        lkr = kw * PRICE_PER_KW
+        # format
+        self.lkr_input.setText(f"{lkr:.2f}")
+        self._suppress = False
+
+    def _lkr_changed(self, t):
+        if self._suppress:
+            return
+        self._suppress = True
+        try:
+            lkr = float(t) if t else 0.0
+        except:
+            lkr = 0.0
+        kw = lkr / PRICE_PER_KW if PRICE_PER_KW else 0.0
+        self.kw_input.setText(f"{kw:.3f}")
+        self._suppress = False
+
+    def _on_next(self):
+        try:
+            kw = float(self.kw_input.text() or '0')
+            lkr = float(self.lkr_input.text() or '0')
+        except:
+            QtWidgets.QMessageBox.warning(self, 'Invalid', 'Please enter a valid amount.')
+            return
+        if lkr <= 0 or kw <= 0:
+            QtWidgets.QMessageBox.warning(self, 'Invalid', 'Amount must be greater than zero.')
+            return
+        self.proceed.emit(kw, lkr)
+
+
+class ProcessingPage(QtWidgets.QWidget):
+    finished = QtCore.pyqtSignal(bool, str)
+
+    def __init__(self, contact_number, port_name, kw, lkr):
+        super().__init__()
+        self.contact = contact_number
+        self.port_name = port_name
+        self.kw = kw
+        self.lkr = lkr
+        self._build_ui()
+        # start processing in a thread
+        threading.Thread(target=self._process_payment_and_activate, daemon=True).start()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout()
+        self.label = QtWidgets.QLabel('Processing payment... Please wait')
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        v.addWidget(self.label)
+        self.log = QtWidgets.QTextEdit()
+        self.log.setReadOnly(True)
+        v.addWidget(self.log)
+        self.setLayout(v)
+
+    def _append(self, s):
+        QtCore.QMetaObject.invokeMethod(self.log, 'append', QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, s))
+
+    def _process_payment_and_activate(self):
+        # 1) Send payment command to card machine via RS232
+        self._append(f"Sending payment request to card machine on {CARD_SERIAL_PORT} for LKR {self.lkr:.2f}")
+        cmd = PAYMENT_COMMAND_TEMPLATE.format(amount_lkr=int(round(self.lkr)))
+        ok, resp = safe_serial_send_receive(CARD_SERIAL_PORT, CARD_BAUDRATE, cmd)
+        if not ok:
+            self._append(f"Card machine communication error: {resp}")
+            self.finished.emit(False, f"Card comms failed: {resp}")
+            return
+        self._append(f"Card machine response: {resp}")
+        # Check for approval substring
+        if PAYMENT_CONFIRM_RESPONSE_SUBSTR not in resp:
+            self._append('Payment not approved by card machine.')
+            self.finished.emit(False, 'Payment not approved')
+            return
+
+        # 2) Send SMS verification
+        msg = f"EV Base: Payment of LKR {self.lkr:.2f} received. Charging {self.kw:.3f} kW on port {self.port_name}."
+        self._append(f"Sending SMS to {self.contact}")
+        ok_sms, sms_resp = send_sms(self.contact, msg)
+        if ok_sms:
+            self._append('SMS sent successfully.')
+        else:
+            self._append(f'SMS failed: {sms_resp} (continuing)')
+
+        # 3) Activate EV charger via serial command
+        self._append(f"Activating EV charger on {EV_CONTROL_SERIAL_PORT}")
+        activate_cmd = EV_ACTIVATE_COMMAND_TEMPLATE.format(port=self.port_name, kw=self.kw)
+        ok_act, act_resp = safe_serial_send_receive(EV_CONTROL_SERIAL_PORT, EV_CONTROL_BAUDRATE, activate_cmd)
+        if not ok_act:
+            self._append(f"EV activation comms failed: {act_resp}")
+            self.finished.emit(False, f"Activation failed: {act_resp}")
+            return
+        self._append(f"EV charger response: {act_resp}")
+
+        # success
+        self._append('Charging started successfully.')
+        self.finished.emit(True, 'Charging started')
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('EV Base Charging')
+        self.resize(900, 600)
+        self._build_ui()
+
+    def _build_ui(self):
+        self.stack = QtWidgets.QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.welcome = WelcomePage()
+        self.welcome.proceed.connect(self._on_got_contact)
+        self.stack.addWidget(self.welcome)
+
+        self.selectport = SelectPortPage()
+        self.selectport.proceed.connect(self._on_got_port)
+        self.stack.addWidget(self.selectport)
+
+        self.amountpage = AmountPage()
+        self.amountpage.proceed.connect(self._on_got_amount)
+        self.stack.addWidget(self.amountpage)
+
+        # processing page will be created dynamically
+
+        self._contact = None
+        self._port = None
+        self._kw = None
+        self._lkr = None
+
+    def _on_got_contact(self, contact):
+        self._contact = contact
+        self.stack.setCurrentWidget(self.selectport)
+
+    def _on_got_port(self, port):
+        self._port = port
+        self.stack.setCurrentWidget(self.amountpage)
+
+    def _on_got_amount(self, kw, lkr):
+        self._kw = kw
+        self._lkr = lkr
+        self._start_processing()
+
+    def _start_processing(self):
+        proc = ProcessingPage(self._contact, self._port, self._kw, self._lkr)
+        index = self.stack.addWidget(proc)
+        self.stack.setCurrentIndex(index)
+        proc.finished.connect(self._on_finished)
+
+    def _on_finished(self, ok, message):
+        if ok:
+            QtWidgets.QMessageBox.information(self, 'Done', message)
+            # Back to welcome for new customer
+            self.stack.setCurrentWidget(self.welcome)
+            # clear inputs
+            self.welcome.contact_input.setText('')
+            # remove processing widget
+            # (we won't remove it to keep code simple)
+        else:
+            QtWidgets.QMessageBox.critical(self, 'Error', message)
+            # return to welcome or try again
+            self.stack.setCurrentWidget(self.welcome)
+
+
+# ---------------------- Main ----------------------
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
